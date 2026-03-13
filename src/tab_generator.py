@@ -57,6 +57,69 @@ ROOT_POSITIONS = {
     'C': (4, 3), 'C#': (4, 4), 'Db': (4, 4), 'D': (4, 5), 'D#': (4, 6), 'Eb': (4, 6),
 }
 
+NOTE_TO_SEMITONE = {
+    'C': 0, 'C#': 1, 'Db': 1,
+    'D': 2, 'D#': 3, 'Eb': 3,
+    'E': 4,
+    'F': 5, 'F#': 6, 'Gb': 6,
+    'G': 7, 'G#': 8, 'Ab': 8,
+    'A': 9, 'A#': 10, 'Bb': 10,
+    'B': 11,
+}
+
+# String index (0=e ... 5=E) -> open note semitone
+OPEN_STRING_SEMITONE = {
+    5: 4,   # Low E
+    4: 9,   # A
+    3: 2,   # D
+}
+
+
+def _is_minor_chord(chord_name):
+    return 'm' in chord_name and 'maj' not in chord_name
+
+
+def _dedupe_fingerings(fingerings):
+    unique = []
+    seen = set()
+    for fingering in fingerings:
+        key = tuple(fingering)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(list(fingering))
+    return unique
+
+
+def _position_key(fingering):
+    frets = [f for f in fingering if f >= 0]
+    if not frets:
+        return (999, 999, 999)
+    span = max(frets) - min(frets)
+    avg = sum(frets) / len(frets)
+    return (min(frets), span, avg)
+
+
+def _in_playable_range(fingering, max_fret=15):
+    frets = [f for f in fingering if f >= 0]
+    return bool(frets) and max(frets) <= max_fret
+
+
+def _build_root6_shape(root_fret, is_minor):
+    if is_minor:
+        # Fm form: [1,1,1,3,3,1]
+        return [root_fret, root_fret, root_fret, root_fret + 2, root_fret + 2, root_fret]
+    # F form: [1,1,2,3,3,1]
+    return [root_fret, root_fret, root_fret + 1, root_fret + 2, root_fret + 2, root_fret]
+
+
+def _build_root5_shape(root_fret, is_minor):
+    if is_minor:
+        # Bbm form: [1,2,3,3,1,-1]
+        return [root_fret, root_fret + 1, root_fret + 2, root_fret + 2, root_fret, -1]
+    # Bb form: [1,3,3,3,1,-1]
+    return [root_fret, root_fret + 2, root_fret + 2, root_fret + 2, root_fret, -1]
+
 def get_root_from_name(chord_name):
     if not chord_name: return 'C'
     if len(chord_name) > 1 and chord_name[1] in ['#', 'b']:
@@ -100,36 +163,102 @@ def get_power_chord(chord_name):
         
     return fingering
 
+
+def _get_basic_chord_fingering(chord_name):
+    if not chord_name:
+        return [-1] * 6
+
+    if chord_name in CHORD_SHAPES:
+        return CHORD_SHAPES[chord_name]
+
+    root = get_root_from_name(chord_name)
+    is_minor = _is_minor_chord(chord_name)
+    base_name = root + ('m' if is_minor else '')
+
+    if base_name in CHORD_SHAPES:
+        return CHORD_SHAPES[base_name]
+
+    if root in CHORD_SHAPES:
+        return CHORD_SHAPES[root]
+
+    return [-1] * 6
+
+
+def get_chord_fingering_options(chord_name, mode='standard'):
+    """
+    Returns same-chord fingering candidates sorted from low to high position.
+    """
+    if not chord_name:
+        return [[-1] * 6]
+
+    root = get_root_from_name(chord_name)
+    root_semitone = NOTE_TO_SEMITONE.get(root)
+
+    if mode == 'power':
+        if root_semitone is None:
+            return [get_power_chord(chord_name)]
+
+        options = []
+        for root_string_idx in [5, 4, 3]:
+            open_semitone = OPEN_STRING_SEMITONE[root_string_idx]
+            base_fret = (root_semitone - open_semitone) % 12
+
+            for octave in [0, 12]:
+                fret = base_fret + octave
+                fingering = [-1] * 6
+                fingering[root_string_idx] = fret
+
+                fifth_string = root_string_idx - 1
+                octave_string = root_string_idx - 2
+                if fifth_string >= 0:
+                    fingering[fifth_string] = fret + 2
+                if octave_string >= 0:
+                    fingering[octave_string] = fret + 2
+
+                if _in_playable_range(fingering):
+                    options.append(fingering)
+
+        options = _dedupe_fingerings(options)
+        options.sort(key=_position_key)
+        return options or [get_power_chord(chord_name)]
+
+    options = []
+
+    # Open / custom dictionary form first so reset returns the familiar shape.
+    basic = _get_basic_chord_fingering(chord_name)
+    if basic != [-1] * 6:
+        options.append(basic)
+
+    if root_semitone is not None:
+        is_minor = _is_minor_chord(chord_name)
+
+        # Root on low E string (F/Fm shape)
+        base_fret_e = (root_semitone - OPEN_STRING_SEMITONE[5]) % 12
+        for octave in [0, 12]:
+            root_fret = base_fret_e + octave
+            fingering = _build_root6_shape(root_fret, is_minor)
+            if _in_playable_range(fingering):
+                options.append(fingering)
+
+        # Root on A string (Bb/Bbm shape)
+        base_fret_a = (root_semitone - OPEN_STRING_SEMITONE[4]) % 12
+        for octave in [0, 12]:
+            root_fret = base_fret_a + octave
+            fingering = _build_root5_shape(root_fret, is_minor)
+            if _in_playable_range(fingering):
+                options.append(fingering)
+
+    options = _dedupe_fingerings(options)
+    options.sort(key=_position_key)
+    return options or [[-1] * 6]
+
 def get_chord_fingering(chord_name, mode='standard'):
     """
     Returns a list of 6 integers representing fret numbers from high e (0) to low E (5).
     -1 means mute.
     """
-    if not chord_name:
-        return [-1] * 6
-
-    if mode == 'power':
-        return get_power_chord(chord_name)
-    
-    # Standard: try exact match
-    if chord_name in CHORD_SHAPES:
-        return CHORD_SHAPES[chord_name]
-    
-    # Try major/minor base
-    root = get_root_from_name(chord_name)
-    is_minor = 'm' in chord_name and 'maj' not in chord_name
-    
-    base_name = root + ('m' if is_minor else '')
-    
-    # Fix for flats/sharps normalization if needed, but basic check first
-    if base_name in CHORD_SHAPES:
-        return CHORD_SHAPES[base_name]
-
-    # Try simple major if minor not found (fallback)
-    if root in CHORD_SHAPES:
-        return CHORD_SHAPES[root]
-        
-    return [-1] * 6 # Not found
+    options = get_chord_fingering_options(chord_name, mode=mode)
+    return options[0] if options else [-1] * 6
 
 def format_tab_string(fingering):
     """

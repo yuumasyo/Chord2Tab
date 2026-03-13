@@ -11,13 +11,13 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 try:
     from src.chord_analyser import estimate_chords, estimate_chords_from_midi, synthesize_midi_to_wav
-    from src.tab_generator import generate_ascii_tab, get_chord_fingering, format_tab_string
+    from src.tab_generator import generate_ascii_tab, get_chord_fingering, get_chord_fingering_options, format_tab_string
 except ImportError:
     # Fallback if running from a different workdir context
     import sys
     sys.path.append('.') 
     from src.chord_analyser import estimate_chords, estimate_chords_from_midi, synthesize_midi_to_wav
-    from src.tab_generator import generate_ascii_tab, get_chord_fingering, format_tab_string
+    from src.tab_generator import generate_ascii_tab, get_chord_fingering, get_chord_fingering_options, format_tab_string
 
 st.set_page_config(page_title="Chord2Tab", layout="wide")
 
@@ -143,9 +143,12 @@ if uploaded_file is not None:
                 
                 # Add tab visual to data
                 for segment in chords_data:
-                    fingering = get_chord_fingering(segment['chord'], mode=mode_key)
+                    fingering_options = get_chord_fingering_options(segment['chord'], mode=mode_key)
+                    fingering = fingering_options[0] if fingering_options else get_chord_fingering(segment['chord'], mode=mode_key)
                     segment['tab_visual'] = format_tab_string(fingering)
                     segment['fingering'] = fingering # Pass fingering for audio synthesis
+                    segment['fingering_options'] = fingering_options
+                    segment['fingering_idx'] = 0
 
                 chords_json = json.dumps(chords_data)
                 
@@ -418,6 +421,7 @@ if uploaded_file is not None:
 
                     // Store original fingerings for reset
                     const originalFingerings = chords.map(c => [...c.fingering]);
+                    const originalFingeringIndices = chords.map(c => c.fingering_idx || 0);
                     // Store original timings for reset
                     const originalTimings = chords.map(c => ({{ start: c.start, end: c.end }}));
                     // Global offset
@@ -485,16 +489,25 @@ if uploaded_file is not None:
                         }}
                     }}
 
+                    function fingeringToTabVisual(fingering) {{
+                        const sNames = ['e', 'B', 'G', 'D', 'A', 'E'];
+                        return fingering.map((f, i) => {{
+                            const fc = f !== -1 ? f : 'x';
+                            return sNames[i] + ' |-' + fc + '-|';
+                        }}).join('\\n');
+                    }}
+
                     // --- Reset position function ---
                     function resetPosition(e, idx) {{
                         e.stopPropagation();
                         const chord = chords[idx];
-                        chord.fingering = [...originalFingerings[idx]];
-                        const sNames = ['e', 'B', 'G', 'D', 'A', 'E'];
-                        chord.tab_visual = chord.fingering.map((f, i) => {{
-                            const fc = f !== -1 ? f : 'x';
-                            return sNames[i] + ' |-' + fc + '-|';
-                        }}).join('\\n');
+                        chord.fingering_idx = originalFingeringIndices[idx];
+                        if (Array.isArray(chord.fingering_options) && chord.fingering_options.length > 0) {{
+                            chord.fingering = [...chord.fingering_options[chord.fingering_idx]];
+                        }} else {{
+                            chord.fingering = [...originalFingerings[idx]];
+                        }}
+                        chord.tab_visual = fingeringToTabVisual(chord.fingering);
                         const card = document.getElementById('card-' + idx);
                         card.querySelector('.tab-visual').textContent = chord.tab_visual;
                     }}
@@ -503,21 +516,17 @@ if uploaded_file is not None:
                     function shiftPosition(e, idx, direction) {{
                         e.stopPropagation();
                         const chord = chords[idx];
-                        const nonMuted = chord.fingering.filter(f => f !== -1);
-                        if (nonMuted.length === 0) return;
-                        // Block shift down if any non-muted fret is already 0
-                        if (direction === -1 && nonMuted.some(f => f <= 0)) return;
-                        // Block shift up beyond fret 24
-                        if (direction === 1 && nonMuted.some(f => f >= 24)) return;
+                        const options = Array.isArray(chord.fingering_options) ? chord.fingering_options : [];
+                        if (options.length <= 1) return;
 
-                        chord.fingering = chord.fingering.map(f => f === -1 ? -1 : f + direction);
+                        const currentIdx = Number.isInteger(chord.fingering_idx) ? chord.fingering_idx : 0;
+                        const nextIdx = currentIdx + direction;
 
-                        // Regenerate tab_visual
-                        const sNames = ['e', 'B', 'G', 'D', 'A', 'E'];
-                        chord.tab_visual = chord.fingering.map((f, i) => {{
-                            const fc = f !== -1 ? f : 'x';
-                            return sNames[i] + ' |-' + fc + '-|';
-                        }}).join('\\n');
+                        if (nextIdx < 0 || nextIdx >= options.length) return;
+
+                        chord.fingering_idx = nextIdx;
+                        chord.fingering = [...options[nextIdx]];
+                        chord.tab_visual = fingeringToTabVisual(chord.fingering);
 
                         // Update card display
                         const card = document.getElementById('card-' + idx);
@@ -541,9 +550,9 @@ if uploaded_file is not None:
                             </div>
                             <div class="tab-visual">${{c.tab_visual}}</div>
                             <div class="position-btns">
-                                <button onclick="shiftPosition(event, ${{idx}}, -1)" title="ポジションを下げる">▼</button>
+                                <button onclick="shiftPosition(event, ${{idx}}, -1)" title="同じコードの低いポジションへ">▼</button>
                                 <button onclick="resetPosition(event, ${{idx}})" title="元のポジションに戻す" style="font-size:0.75em;">↺</button>
-                                <button onclick="shiftPosition(event, ${{idx}}, 1)" title="ポジションを上げる">▲</button>
+                                <button onclick="shiftPosition(event, ${{idx}}, 1)" title="同じコードの高いポジションへ">▲</button>
                             </div>
                             <div class="timing-row">
                                 <button onclick="adjustChordTiming(event, ${{idx}}, -0.1)" title="-0.1s">◀</button>
