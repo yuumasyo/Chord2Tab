@@ -401,7 +401,7 @@ def estimate_chords(audio_path, output_midi_path=None, separate=False, use_btc=T
                 })
     
     # === Post-processing: merge very short segments (<0.15s) into neighbors ===
-    MIN_DURATION = 0.15
+    MIN_DURATION = 0.05
     if len(buffer_results) > 1:
         merged = [buffer_results[0]]
         for seg in buffer_results[1:]:
@@ -416,103 +416,261 @@ def estimate_chords(audio_path, output_midi_path=None, separate=False, use_btc=T
     print("[SUCCESS] Hybrid Analysis Completed!")
     return buffer_results, midi_bytes
 
-def estimate_chords_from_midi(midi_path):
+def estimate_chords_from_midi(midi_path, synth_wav_path=None, use_btc=True, use_librosa_chroma=True):
+    """
+    MIDI2Chord ハイブリッド解析。
+    エンジン1: MIDIクロマ（ノート情報＝正確な音源データ、常時有効）
+    エンジン2: BTC AI（合成WAVに対してTransformer推論、use_btc=True時）
+    エンジン3: Librosa HPSS + Multi-Chroma（合成WAVに対して、use_librosa_chroma=True時）
+    三エンジンの加重アンサンブル → テンポラルスムージング → 短セグメントマージ
+    """
     print(f"\n{'='*60}")
-    print(f"[INFO] Midi2Code Mode: Direct MIDI Analysis")
+    print(f"[INFO] Midi2Chord Hybrid Mode: MIDIChroma=True, BTC={use_btc}, Chroma={use_librosa_chroma}")
     print(f"{'='*60}")
-    
+
     import pretty_midi
+    import tempfile
+
     midi_data = pretty_midi.PrettyMIDI(midi_path)
-    
+
+    # --- 合成WAVの準備 (BTC or Librosa が必要な場合) ---
+    _tmp_wav_owner = False  # このスコープで生成したtempか否か
+    if (use_btc or use_librosa_chroma):
+        if synth_wav_path is None or not os.path.exists(synth_wav_path):
+            tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            synth_wav_path = tmp.name
+            tmp.close()
+            _tmp_wav_owner = True
+            synthesize_midi_to_wav(midi_path, synth_wav_path)
+
+    # --- 動的タイムグリッドの構築 ---
     beats = midi_data.get_beats()
     if len(beats) < 2:
         duration = midi_data.get_end_time()
         beats = np.arange(0, duration, 0.5)
         if duration > beats[-1]:
             beats = np.append(beats, duration)
-            
-    # Templates for Chord Matching
+
+    all_notes = []
+    for inst in midi_data.instruments:
+        if inst.is_drum:
+            continue
+        all_notes.extend(inst.notes)
+
+    # 音符オンセットを拍グリッドに統合（アルペジオ等の内部遷移を反映）
+    note_onsets = [n.start for n in all_notes]
+    if note_onsets:
+        note_onsets = np.sort(np.unique(note_onsets))
+        refined_edges = []
+        for on in note_onsets:
+            if not refined_edges or on - refined_edges[-1] >= 0.1:
+                refined_edges.append(on)
+        combined_times = np.sort(np.unique(np.concatenate((beats, refined_edges))))
+        final_times = [combined_times[0]]
+        for t in combined_times[1:]:
+            if t - final_times[-1] >= 0.15:
+                final_times.append(t)
+        beats = np.array(final_times)
+
+    end_time = midi_data.get_end_time()
+    if beats[-1] < end_time:
+        beats = np.append(beats, end_time)
+
+    # --- コードテンプレート (25クラス: maj×12 + min×12 + N) ---
     maj_temp = np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0])
     min_temp = np.array([1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0])
     templates = []
-    notes_list = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
     chord_names = []
-    
+    notes_list = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
     for i in range(12):
         templates.append(np.roll(maj_temp, i))
         chord_names.append(notes_list[i])
     for i in range(12):
         templates.append(np.roll(min_temp, i))
         chord_names.append(notes_list[i] + 'm')
-        
-    templates.append(np.zeros(12)) # 'N'
+    templates.append(np.zeros(12))
     chord_names.append('N')
     templates = np.array(templates)
-    
     norms = np.linalg.norm(templates, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     templates = templates / norms
-    
-    buffer_results = []
-    
-    all_notes = []
-    for inst in midi_data.instruments:
-        if inst.is_drum: continue
-        all_notes.extend(inst.notes)
-        
-    # 音符自体が実際に発音される（オンセット）タイミングから、細かな遷移ポイントを抽出する
-    note_onsets = [n.start for n in all_notes]
-    if note_onsets:
-        # 重複や近すぎるタイミング(0.1秒以内)を整理
-        note_onsets = np.sort(np.unique(note_onsets))
-        refined_edges = []
-        for on in note_onsets:
-            if not refined_edges or on - refined_edges[-1] >= 0.1:
-                refined_edges.append(on)
-                
-        # 拍のタイミング（beats）と、実際の音符のタイミング（refined_edges）を統合してグリッドを作る
-        combined_times = np.sort(np.unique(np.concatenate((beats, refined_edges))))
-        
-        # さらに、間隔が短すぎる細切れなグリッド（0.15秒未満など。アルペジオのブレ等）は削除する
-        final_times = [combined_times[0]]
-        for t in combined_times[1:]:
-            if t - final_times[-1] >= 0.15:
-                final_times.append(t)
-                
-        beats = np.array(final_times)
-    
-        # 曲の一番最後までグリッドが届いていなければ追加
-        end_time = midi_data.get_end_time()
-        if beats[-1] < end_time:
-            beats = np.append(beats, end_time)
 
-    print("[INFO] Calculating Chroma over Dynamic MIDI Grid...")
-    for i in range(len(beats)-1):
+    # --- Softmax ヘルパー ---
+    def _softmax(x, temperature=1.0):
+        x = np.asarray(x, dtype=np.float64)
+        x = x / max(temperature, 1e-8)
+        x = x - np.max(x)
+        e = np.exp(x)
+        s = np.sum(e)
+        if s < 1e-12:
+            return np.ones_like(x) / len(x)
+        return e / s
+
+    # === エンジン2: BTC AI (合成WAV) ===
+    btc_frame_probs = []
+    if use_btc:
+        import torch
+        btc_path = download_btc_if_needed()
+        if btc_path not in sys.path:
+            sys.path.append(btc_path)
+        try:
+            from utils.hparams import HParams
+            from btc_model import BTC_model
+            from utils.mir_eval_modules import audio_file_to_features
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            config_path = os.path.join(btc_path, "run_config.yaml")
+            config = HParams.load(config_path)
+            model_file = os.path.join(btc_path, "test", "btc_model.pt")
+            model = BTC_model(config=config.model).to(device)
+            print("[BTC] Loading weights...")
+            if os.path.isfile(model_file):
+                checkpoint = torch.load(model_file, map_location=device, weights_only=False)
+                mean = checkpoint['mean']
+                std = checkpoint['std']
+                model.load_state_dict(checkpoint['model'])
+                print("[BTC] Extracting features from synthesized audio...")
+                feature, feature_per_second, _ = audio_file_to_features(synth_wav_path, config)
+                feature = feature.T
+                feature = (feature - mean) / std
+                time_unit = feature_per_second
+                n_timestep = config.model['timestep']
+                num_pad = n_timestep - (feature.shape[0] % n_timestep)
+                feature = np.pad(feature, ((0, num_pad), (0, 0)), mode="constant", constant_values=0)
+                num_instance = feature.shape[0] // n_timestep
+                btc_to_template = np.zeros(25, dtype=int)
+                for k in range(12):
+                    btc_to_template[2 * k] = k
+                    btc_to_template[2 * k + 1] = 12 + k
+                btc_to_template[24] = 24
+                print("[BTC] Running inference on synthesized audio...")
+                with torch.no_grad():
+                    model.eval()
+                    feature_tensor = torch.tensor(feature, dtype=torch.float32).unsqueeze(0).to(device)
+                    for t in range(num_instance):
+                        self_attn_output, _ = model.self_attn_layers(
+                            feature_tensor[:, n_timestep * t:n_timestep * (t + 1), :]
+                        )
+                        logits = model.output_layer.output_projection(self_attn_output)
+                        probs = torch.softmax(logits, dim=-1).squeeze(0).cpu().numpy()
+                        for i in range(n_timestep):
+                            cur_time = float(time_unit) * (n_timestep * t + i)
+                            remapped = np.zeros(25)
+                            for btc_idx in range(25):
+                                remapped[btc_to_template[btc_idx]] = probs[i, btc_idx]
+                            btc_frame_probs.append((cur_time, remapped))
+            else:
+                print("[WARN] BTC weights not found, skipping BTC engine.")
+                use_btc = False
+        except Exception as e:
+            print(f"[WARN] BTC engine failed: {e}. Skipping.")
+            use_btc = False
+
+    # === エンジン3: Librosa HPSS + Multi-Chroma (合成WAV) ===
+    librosa_scores = None
+    y_synth = sr_synth = None
+    if use_librosa_chroma:
+        try:
+            print("[Librosa] HPSS + Multi-Chroma on synthesized audio...")
+            y_synth, sr_synth = librosa.load(synth_wav_path, sr=22050)
+            y_harmonic, _ = librosa.effects.hpss(y_synth)
+            chroma_cqt = librosa.feature.chroma_cqt(y=y_harmonic, sr=sr_synth, n_chroma=12, n_octaves=6)
+            chroma_cens = librosa.feature.chroma_cens(y=y_harmonic, sr=sr_synth)
+            min_len = min(chroma_cqt.shape[1], chroma_cens.shape[1])
+            chroma_fused = 0.6 * chroma_cqt[:, :min_len] + 0.4 * chroma_cens[:, :min_len]
+            librosa_scores = np.dot(templates, chroma_fused)  # shape: (25, frames)
+        except Exception as e:
+            print(f"[WARN] Librosa Chroma failed: {e}. Skipping.")
+            librosa_scores = None
+
+    # 一時WAVの削除
+    if _tmp_wav_owner and synth_wav_path and os.path.exists(synth_wav_path):
+        try:
+            os.remove(synth_wav_path)
+        except Exception:
+            pass
+
+    # --- 重み設定 ---
+    # MIDIクロマはノート情報が正確な「正解データ」なので最高重み
+    w_midi = 5.0
+    w_btc = 4.0 if use_btc and btc_frame_probs else 0.0
+    w_librosa = 2.5 if use_librosa_chroma and librosa_scores is not None else 0.0
+    total_w = w_midi + w_btc + w_librosa
+    if total_w == 0:
+        w_midi = 1.0
+        total_w = 1.0
+    w_midi /= total_w
+    w_btc /= total_w
+    w_librosa /= total_w
+
+    # --- 拍ごとのスコアリング ---
+    beat_chord_indices = []
+    beat_score_matrices = []
+
+    print("[INFO] Scoring chords over dynamic MIDI grid...")
+    for i in range(len(beats) - 1):
         s_time = beats[i]
-        e_time = beats[i+1]
-        
+        e_time = beats[i + 1]
+
+        # Engine 1: MIDIクロマ (velocity × overlap 加重)
         chroma = np.zeros(12)
         has_notes = False
-        
-        # 実際にその区間で鳴っているすべての音符のエネルギー（Chroma）を計算
         for note in all_notes:
             if note.start < e_time and note.end > s_time:
                 overlap = min(e_time, note.end) - max(s_time, note.start)
                 if overlap > 0:
-                    # ピッチクラス（0:C, 1:C# ... 11:B）ごとに、ベロシティと重なり時間を加算
                     chroma[note.pitch % 12] += overlap * (note.velocity / 127.0)
                     has_notes = True
-                    
-        chord = 'N'
         if has_notes and np.sum(chroma) > 0:
             chroma_norm = chroma / np.linalg.norm(chroma)
-            probs = np.dot(templates, chroma_norm)
-            best_idx = np.argmax(probs)
-            # スレッショルド: 何のテンプレにもほとんど一致しない(単音すぎる等)場合はN判定にする
-            if probs[best_idx] > 0.4:  
-                chord = chord_names[best_idx]
-            
-        # N（判定不能/無音）を含めずに、そのまま直前のコードを維持するか新規追加する
+            probs_midi = _softmax(np.dot(templates, chroma_norm), temperature=0.8)
+        else:
+            probs_midi = np.zeros(25)
+            probs_midi[24] = 1.0  # 'N'
+
+        # Engine 2: BTC
+        probs_btc = np.zeros(25)
+        if w_btc > 0:
+            frames_in_beat = [p for t, p in btc_frame_probs if s_time <= t < e_time]
+            if frames_in_beat:
+                probs_btc = _softmax(np.mean(frames_in_beat, axis=0), temperature=0.5)
+            else:
+                closest = min(btc_frame_probs, key=lambda x: abs(x[0] - (s_time + e_time) / 2.0))
+                probs_btc = _softmax(closest[1].copy(), temperature=0.5)
+
+        # Engine 3: Librosa
+        probs_librosa = np.zeros(25)
+        if w_librosa > 0:
+            start_frame = librosa.time_to_frames(s_time, sr=sr_synth)
+            end_frame = librosa.time_to_frames(e_time, sr=sr_synth)
+            if end_frame > start_frame:
+                raw = np.mean(librosa_scores[:, start_frame:end_frame], axis=1)
+                probs_librosa = _softmax(raw, temperature=0.8)
+            else:
+                probs_librosa = np.ones(25) / 25.0
+
+        combined = probs_midi * w_midi + probs_btc * w_btc + probs_librosa * w_librosa
+        beat_score_matrices.append(combined)
+        beat_chord_indices.append(int(np.argmax(combined)))
+
+    # --- テンポラルスムージング (3拍メジアンフィルタ) ---
+    smoothed_indices = list(beat_chord_indices)
+    if len(smoothed_indices) >= 3:
+        for j in range(1, len(smoothed_indices) - 1):
+            prev_idx = beat_chord_indices[j - 1]
+            curr_idx = beat_chord_indices[j]
+            next_idx = beat_chord_indices[j + 1]
+            if prev_idx == next_idx and curr_idx != prev_idx:
+                alt_score = beat_score_matrices[j][prev_idx]
+                best_score = beat_score_matrices[j][curr_idx]
+                if alt_score > best_score * 0.5:
+                    smoothed_indices[j] = prev_idx
+
+    # --- 結果構築 ---
+    buffer_results = []
+    for i in range(len(beats) - 1):
+        chord = chord_names[smoothed_indices[i]]
+        s_time = beats[i]
+        e_time = beats[i + 1]
         if chord != 'N':
             if buffer_results and buffer_results[-1]['chord'] == chord:
                 buffer_results[-1]['end'] = float(e_time)
@@ -525,13 +683,24 @@ def estimate_chords_from_midi(midi_path):
                     "chord": chord
                 })
         else:
-            # 音が一時的に途切れたりNになった場合でも、「ギターのコード弾き」の観点では
-            # 無音区間を作らず前のコードの余韻として継続させた方がTab譜としての遷移が自然になる
+            # 無音区間は前のコードに吸収して自然な余韻を維持
             if buffer_results:
                 buffer_results[-1]['end'] = float(e_time)
                 buffer_results[-1]['duration'] = float(e_time - buffer_results[-1]['start'])
-                
-    print(f"[SUCCESS] Analyzed {len(buffer_results)} chord segments.")
+
+    # --- 短セグメントのマージ (<0.15s) ---
+    MIN_DURATION = 0.15
+    if len(buffer_results) > 1:
+        merged = [buffer_results[0]]
+        for seg in buffer_results[1:]:
+            if seg['duration'] < MIN_DURATION:
+                merged[-1]['end'] = seg['end']
+                merged[-1]['duration'] = merged[-1]['end'] - merged[-1]['start']
+            else:
+                merged.append(seg)
+        buffer_results = merged
+
+    print(f"[SUCCESS] Midi2Chord Hybrid Analysis: {len(buffer_results)} chord segments.")
     return buffer_results
 
 def synthesize_midi_to_wav(midi_path, wav_path):

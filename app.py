@@ -94,16 +94,22 @@ if uploaded_file is not None:
 
         try:
             if is_midi:
-                with st.spinner('MIDIを解析＆音声を合成中... (Midi2Codeモード)'):
-                    chords_data = estimate_chords_from_midi(file_path)
-                    
-                    with open(file_path, "rb") as f:
-                        midi_bytes = f.read()
-                        
-                    # Synthesize preview audio
+                # MIDIの場合: 先にWAVを合成してから、合成WAVを BTC/Librosa に渡す（二重合成を回避）
+                with st.spinner('MIDIを音声に変換中...'):
                     wav_path = file_path + "_synth.wav"
                     synthesize_midi_to_wav(file_path, wav_path)
-                    audio_path = wav_path # Route audio player to the synthesized WAV
+                    audio_path = wav_path  # オーディオプレイヤー用
+
+                with st.spinner('MIDIをハイブリッド解析中... (コンソールに進捗が表示されます)'):
+                    chords_data = estimate_chords_from_midi(
+                        file_path,
+                        synth_wav_path=wav_path,
+                        use_btc=use_btc,
+                        use_librosa_chroma=use_librosa_chroma,
+                    )
+
+                with open(file_path, "rb") as f:
+                    midi_bytes = f.read()
             else:
                 with st.spinner('音声を解析中... (コンソールに進捗が表示されます)'):
                     # Estimate Chords (returns chords_data, midi_bytes)
